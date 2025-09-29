@@ -1,0 +1,24 @@
+# Python + Poetry ignores 
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+.venv*/
+.env/
+.env*/
+
+# Poetry
+*.egg-info/
+dist/
+build/
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
