@@ -2,16 +2,24 @@ import logging
 from pymodbus.client.serial import ModbusSerialClient
 import time
 import pymodbus
+import inspect
+
+# Inspect the signature of the read_input_registers method
+#print(inspect.signature(ModbusSerialClient.read_input_registers))
+
+# Debugging information
+#print("pymodbus version:", pymodbus.__version__)
+#print("ModbusSerialClient.read_input_registers:", pymodbus.client.serial.ModbusSerialClient.read_input_registers)
 
 # Enable debug logging for pymodbus
 logging.basicConfig()
-logging.getLogger().setLevel(logging.DEBUG)
+logging.getLogger().setLevel(logging.INFO)
 
 # Print pymodbus version at startup
 print(f"Using pymodbus version: {pymodbus.__version__}")
 
 class BronkhorstModbusController:
-    def __init__(self, port, address=1, baudrate=9600, parity='N'):
+    def __init__(self, port, address=1, baudrate=38400, parity='N'):
         self.port = port
         self.address = address
         self.baudrate = baudrate
@@ -25,8 +33,8 @@ class BronkhorstModbusController:
             parity=self.parity,
             stopbits=1,    # Standard Modbus RTU setting
             bytesize=8,    # Standard Modbus RTU setting
-            timeout=2.0,   # Increased timeout for more reliable communication
-            retries=6      # Number of retry attempts
+            timeout=1,   # Increased timeout for more reliable communication
+            retries=3      # Number of retry attempts
         )
 
     def connect(self):
@@ -38,12 +46,12 @@ class BronkhorstModbusController:
             pass
             
         # Try to connect with proper delay
-        time.sleep(0.5)  # Short delay before connecting
+        # time.sleep(0.5)  # Short delay before connecting
         connected = self.client.connect()
-        print(f"Connect result: {connected}")
+        # print(f"Connect result: {connected}")
         
-        if connected:
-            time.sleep(1.5)  # Longer delay after successful connection for device initialization
+        # if connected:
+        #     time.sleep(1.5)  # Longer delay after successful connection for device initialization
         
         return connected
 
@@ -55,7 +63,7 @@ class BronkhorstModbusController:
         try:
             value = int((flow_rate / 5000) * 32000)
             print(f"Writing value {value} to register 34 (set flow rate)")
-            result = self.client.write_register(34, value, slave=self.address)
+            result = self.client.write_register(34, value, device_id=self.address)
             print(f"Write result: {result}")
             if result.isError():
                 print(f"Modbus error: {result}")
@@ -68,7 +76,7 @@ class BronkhorstModbusController:
         try:
             def read_register(register):
                 print(f"Reading register {register}")
-                result = self.client.read_input_registers(register, count=1, slave=self.address)
+                result = self.client.read_input_registers(register, count=1, device_id=self.address)
                 print(f"Read result: {result}")
                 if not result.isError():
                     return result.registers[0]
@@ -83,7 +91,7 @@ class BronkhorstModbusController:
 
             return {
                 'flow_rate': (flow_raw / 32000) * 5000,
-                'inlet_pressure': p1_raw / 1000,
+                'inlet_pressure': p1_raw / 1000, 
                 'outlet_pressure': p2_raw / 1000,
                 'temperature': temp_raw / 10,
                 'pressure_drop': max(0, (p1_raw - p2_raw) / 1000),

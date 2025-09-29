@@ -20,13 +20,13 @@ import os
 class BronkhorstController:
     """Communication interface for Bronkhorst FLEXI-FLOW Compact"""
     
-    def __init__(self, port='COM1', baudrate=38400, address=3):
+    def __init__(self, port='COM3', baudrate=38400, address=1):
         self.port = port
         self.baudrate = baudrate
         self.address = address
         self.connection = None
         self.connected = False
-        self.simulation_mode = True  # Set to False for real hardware
+        self.simulation_mode = False  # Set to False for real hardware
         
         # For real hardware, import and use the Modbus controller
         if not self.simulation_mode:
