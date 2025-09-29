@@ -55,7 +55,7 @@ class BronkhorstModbusController:
         try:
             value = int((flow_rate / 5000) * 32000)
             print(f"Writing value {value} to register 34 (set flow rate)")
-            result = self.client.write_register(34, value, slave=self.address)
+            result = self.client.write_register(34, value, device_id=self.address)
             print(f"Write result: {result}")
             if result.isError():
                 print(f"Modbus error: {result}")
@@ -68,7 +68,7 @@ class BronkhorstModbusController:
         try:
             def read_register(register):
                 print(f"Reading register {register}")
-                result = self.client.read_input_registers(register, count=1, slave=self.address)
+                result = self.client.read_input_registers(register, count=1, device_id=self.address)
                 print(f"Read result: {result}")
                 if not result.isError():
                     return result.registers[0]

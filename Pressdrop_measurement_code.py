@@ -16,17 +16,26 @@ import time
 import json
 from datetime import datetime
 import os
+import queue
 
 class BronkhorstController:
     """Communication interface for Bronkhorst FLEXI-FLOW Compact"""
     
-    def __init__(self, port='COM1', baudrate=38400, address=3):
+    def __init__(self, port='COM3', baudrate=38400, address=1):
         self.port = port
         self.baudrate = baudrate
         self.address = address
         self.connection = None
         self.connected = False
         self.simulation_mode = True  # Set to False for real hardware
+        self.modbus_controller = None  # Initialize to None
+        
+        # Thread-safe data storage
+        self.latest_data = None
+        self.data_lock = threading.Lock()
+        
+        # Command lock to prevent simultaneous Modbus operations
+        self.command_lock = threading.Lock()
         
         # For real hardware, import and use the Modbus controller
         if not self.simulation_mode:
@@ -54,7 +63,7 @@ class BronkhorstController:
         if self.simulation_mode:
             self.connected = False
         else:
-            if hasattr(self, 'modbus_controller'):
+            if self.modbus_controller is not None:
                 self.modbus_controller.disconnect()
             self.connected = False
     
@@ -64,7 +73,9 @@ class BronkhorstController:
             print(f"Simulated: Setting flow rate to {flow_rate} ml/min")
             return True
         else:
-            return self.modbus_controller.set_flow_rate(flow_rate)
+            with self.command_lock:
+                time.sleep(0.1)  # Small delay between commands
+                return self.modbus_controller.set_flow_rate(flow_rate)
     
     def get_measurements(self):
         """Get current measurements: flow, P1 (inlet), P2 (outlet), temperature"""
@@ -85,8 +96,20 @@ class BronkhorstController:
                 'timestamp': time.time()
             }
         else:
-            # Use real Modbus measurements
-            return self.modbus_controller.get_all_measurements()
+            # Use real Modbus measurements with locking
+            with self.command_lock:
+                time.sleep(0.1)  # Small delay between commands
+                return self.modbus_controller.get_all_measurements()
+    
+    def get_latest_data(self):
+        """Get the latest cached data (thread-safe)"""
+        with self.data_lock:
+            return self.latest_data
+    
+    def update_latest_data(self, data):
+        """Update the latest cached data (thread-safe)"""
+        with self.data_lock:
+            self.latest_data = data
 
 class PressureDropTester:
     """Main application class"""
@@ -101,6 +124,11 @@ class PressureDropTester:
         self.reference_data = []
         self.test_running = False
         self.test_thread = None
+        
+        # Background reading thread
+        self.reading_thread = None
+        self.reading_active = False
+        self.update_scheduled = False  # Prevent multiple update_readings schedules
         
         # Controller
         self.controller = BronkhorstController()
@@ -233,13 +261,56 @@ class PressureDropTester:
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         
         # Start reading updates
+        self.update_scheduled = True
         self.update_readings()
+    
+    def start_background_reading(self):
+        """Start background thread for reading measurements"""
+        if self.reading_thread is None or not self.reading_thread.is_alive():
+            self.reading_active = True
+            self.reading_thread = threading.Thread(target=self._background_reading_loop, daemon=True)
+            self.reading_thread.start()
+    
+    def stop_background_reading(self):
+        """Stop background reading thread"""
+        self.reading_active = False
+        if self.reading_thread:
+            self.reading_thread.join(timeout=2.0)
+    
+    def _background_reading_loop(self):
+        """Background loop to continuously read measurements"""
+        while self.reading_active and self.controller.connected:
+            try:
+                data = self.controller.get_measurements()
+                if data:
+                    self.controller.update_latest_data(data)
+            except Exception as e:
+                print(f"Error reading measurements: {e}")
+            time.sleep(2.0)  # Increased delay - read every 2 seconds to avoid overwhelming device
         
     def toggle_simulation(self):
         """Toggle between simulation and real hardware mode"""
-        self.controller.simulation_mode = self.sim_mode_var.get()
+        new_mode = self.sim_mode_var.get()
+        
+        # If switching to hardware mode, try to import modbus controller
+        if not new_mode and self.controller.modbus_controller is None:
+            try:
+                from modbus_controller import BronkhorstModbusController
+                self.controller.modbus_controller = BronkhorstModbusController(
+                    self.controller.port, 
+                    self.controller.address, 
+                    self.controller.baudrate
+                )
+            except ImportError:
+                messagebox.showerror("Error", "Modbus controller not available. Staying in simulation mode.")
+                self.sim_mode_var.set(True)
+                return
+        
+        self.controller.simulation_mode = new_mode
+        
         if self.controller.connected:
             # Reconnect with new mode
+            self.stop_background_reading()
             self.controller.disconnect()
             self.status_label.config(text="Disconnected", foreground="red")
             self.connect_btn.config(text="Connect")
@@ -248,35 +319,59 @@ class PressureDropTester:
         """Connect or disconnect from controller"""
         if not self.controller.connected:
             self.controller.port = self.port_var.get()
-            if self.controller.connect():
-                self.status_label.config(text="Connected", foreground="green")
-                self.connect_btn.config(text="Disconnect")
-            else:
-                messagebox.showerror("Error", "Failed to connect to controller")
+            # Disable button during connection attempt
+            self.connect_btn.config(state='disabled')
+            self.status_label.config(text="Connecting...", foreground="orange")
+            
+            # Connect in background thread to avoid blocking
+            def connect_thread():
+                success = self.controller.connect()
+                if success:
+                    self.start_background_reading()
+                    self.root.after(0, lambda: self.status_label.config(text="Connected", foreground="green"))
+                    self.root.after(0, lambda: self.connect_btn.config(text="Disconnect", state='normal'))
+                else:
+                    self.root.after(0, lambda: messagebox.showerror("Error", "Failed to connect to controller"))
+                    self.root.after(0, lambda: self.status_label.config(text="Disconnected", foreground="red"))
+                    self.root.after(0, lambda: self.connect_btn.config(text="Connect", state='normal'))
+            
+            threading.Thread(target=connect_thread, daemon=True).start()
         else:
+            self.stop_background_reading()
             self.controller.disconnect()
             self.status_label.config(text="Disconnected", foreground="red")
             self.connect_btn.config(text="Connect")
     
     def update_readings(self):
         """Update current readings display"""
-        data = self.controller.get_measurements()
-        if data:
-            self.flow_label.config(text=f"Flow: {data['flow_rate']:.1f} ml/min")
-            self.p1_label.config(text=f"Inlet P: {data['inlet_pressure']:.3f} bar")
-            self.p2_label.config(text=f"Outlet P: {data['outlet_pressure']:.3f} bar")
-            self.dp_label.config(text=f"ΔP: {data['pressure_drop']*1000:.1f} mbar")
-            self.temp_label.config(text=f"Temp: {data['temperature']:.1f} °C")
+        if not self.update_scheduled:
+            return  # Don't continue if we've been cancelled
+            
+        if self.controller.connected:
+            data = self.controller.get_latest_data()
+            if data:
+                try:
+                    self.flow_label.config(text=f"Flow: {data['flow_rate']:.1f} ml/min")
+                    self.p1_label.config(text=f"Inlet P: {data['inlet_pressure']:.3f} bar")
+                    self.p2_label.config(text=f"Outlet P: {data['outlet_pressure']:.3f} bar")
+                    self.dp_label.config(text=f"ΔP: {data['pressure_drop']*1000:.1f} mbar")
+                    self.temp_label.config(text=f"Temp: {data['temperature']:.1f} °C")
+                except tk.TclError:
+                    # Widget was destroyed, stop updates
+                    self.update_scheduled = False
+                    return
         
         # Schedule next update
-        self.root.after(1000, self.update_readings)
+        if self.update_scheduled:
+            self.root.after(1000, self.update_readings)
     
     def set_manual_flow(self):
         """Set manual flow rate"""
         try:
             flow_rate = float(self.manual_flow_var.get())
             if 0 <= flow_rate <= 5000:
-                self.controller.set_flow_rate(flow_rate)
+                # Run in background thread to avoid blocking
+                threading.Thread(target=lambda: self.controller.set_flow_rate(flow_rate), daemon=True).start()
             else:
                 messagebox.showerror("Error", "Flow rate must be between 0 and 5000 ml/min")
         except ValueError:
@@ -341,7 +436,7 @@ class PressureDropTester:
             self.root.after(0, lambda: self.stop_btn.config(state='disabled'))
             self.root.after(0, lambda: messagebox.showinfo("Complete", "Reference measurement completed"))
         
-        self.test_thread = threading.Thread(target=run_reference)
+        self.test_thread = threading.Thread(target=run_reference, daemon=True)
         self.test_thread.start()
     
     def start_test(self):
@@ -416,7 +511,7 @@ class PressureDropTester:
             self.root.after(0, lambda: self.stop_btn.config(state='disabled'))
             self.root.after(0, lambda: messagebox.showinfo("Complete", "Test completed"))
         
-        self.test_thread = threading.Thread(target=run_test)
+        self.test_thread = threading.Thread(target=run_test, daemon=True)
         self.test_thread.start()
     
     def stop_test(self):
@@ -506,7 +601,14 @@ class PressureDropTester:
     
     def run(self):
         """Start the application"""
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            # Clean up on exit
+            self.update_scheduled = False
+            self.stop_background_reading()
+            if self.controller.connected:
+                self.controller.disconnect()
 
 if __name__ == "__main__":
     app = PressureDropTester()
