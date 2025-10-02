@@ -822,24 +822,45 @@ class PressureDropTester:
         if not self.current_data:
             messagebox.showwarning("Warning", "No data to save")
             return
-        
-        filename = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-            initialname=f"{self.current_sample}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        )
-        
-        if filename:
+
+        # Sanitize sample name for Windows filenames
+        sample = (self.current_sample or "run").strip()
+        bad = '\\/:*?"<>|'
+        for ch in bad:
+            sample = sample.replace(ch, "_")
+
+        try:
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+                initialfile=f"{sample}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                # ^^^ note: on some Tk builds, use 'initialfile' (not 'initialname')
+            )
+        except Exception as e:
+            logging.error(f"Save dialog failed: {e}")
+            messagebox.showerror("Error", f"Failed to open Save dialog:\n{e}")
+            return
+
+        if not filename:
+            return  # user cancelled
+
+        try:
+            # Ensure data is DataFrame-friendly (convert any numpy types cleanly)
             df = pd.DataFrame(self.current_data)
             df.to_csv(filename, index=False)
-            
+
             # Also save reference data if available
-            if self.reference_data:
-                ref_filename = filename.replace('.csv', '_reference.csv')
+            if getattr(self, "reference_data", None):
+                ref_filename = filename.replace(".csv", "_reference.csv")
                 ref_df = pd.DataFrame(self.reference_data)
                 ref_df.to_csv(ref_filename, index=False)
-            
-            messagebox.showinfo("Success", f"Data saved to {filename}")
+
+            messagebox.showinfo("Success", f"Data saved to:\n{filename}")
+
+        except Exception as e:
+            logging.exception("Failed to save data")
+            messagebox.showerror("Error", f"Failed to save data:\n{e}")
+
     
     def load_reference(self):
         """Load reference data from CSV file"""
