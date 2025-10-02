@@ -43,9 +43,9 @@ logging.basicConfig(
 )
 
 # These lines reduce unnecessary warning messages from the graphical components
-logging.getLogger('matplotlib').setLevel(logging.WARNING)
-logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
-logging.getLogger('PIL.PngImagePlugin').setLevel(logging.WARNING)
+logging.getLogger('matplotlib').setLevel(logging.INFO)
+logging.getLogger('matplotlib.font_manager').setLevel(logging.INFO)
+logging.getLogger('PIL.PngImagePlugin').setLevel(logging.INFO)
 
 logging.info("Starting Pressure Drop Test Application")
 

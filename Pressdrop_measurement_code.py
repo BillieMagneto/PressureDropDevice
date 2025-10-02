@@ -10,81 +10,218 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import numpy as np
 import pandas as pd
-import serial
 import threading
 import time
 import json
 from datetime import datetime
 import os
-import queue
+import logging
+import propar
+
+# Set up logging to both file and console
+log_filename = 'pressure_drop_measurements.log'
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_filename),
+        logging.StreamHandler()
+    ]
+)
+
+# These lines reduce unnecessary warning messages from the graphical components
+logging.getLogger('matplotlib').setLevel(logging.INFO)
+logging.getLogger('matplotlib.font_manager').setLevel(logging.INFO)
+logging.getLogger('PIL.PngImagePlugin').setLevel(logging.INFO)
+
+logging.info("Starting Pressure Drop Test Application")
+
+# A class is like a blueprint for creating objects. Think of it as a template that defines
+# what something can do and what information it can store. For example, if you were designing
+# a car system, you might have a 'Car' class that defines what all cars have in common.
 
 class BronkhorstController:
-    """Communication interface for Bronkhorst FLEXI-FLOW Compact"""
+    """This class handles all communication with the Bronkhorst flow controller device
+    using the official bronkhorst-propar Python driver."""
     
-    def __init__(self, port='COM3', baudrate=38400, address=1):
-        self.port = port
-        self.baudrate = baudrate
-        self.address = address
-        self.connection = None
+    def __init__(self, port=None, baudrate=38400):
+        """Initialize the controller
+        
+        Args:
+            port (str): COM port name (e.g., 'COM1')
+            baudrate (int): Communication speed (default 38400 for Bronkhorst)
+        """
+        self.port = port          
+        self.baudrate = baudrate  
+        self.simulation_mode = False
         self.connected = False
-        self.simulation_mode = True  # Set to False for real hardware
-        self.modbus_controller = None  # Initialize to None
-        
-        # Thread-safe data storage
-        self.latest_data = None
-        self.data_lock = threading.Lock()
-        
-        # Command lock to prevent simultaneous Modbus operations
-        self.command_lock = threading.Lock()
-        
-        # For real hardware, import and use the Modbus controller
-        if not self.simulation_mode:
-            try:
-                from modbus_controller import BronkhorstModbusController
-                self.modbus_controller = BronkhorstModbusController(port, address, baudrate)
-            except ImportError:
-                print("Modbus controller not available, using simulation mode")
-                self.simulation_mode = True
+        self.instrument = None    # propar instrument instance
+        self.master = None       # propar master instance
+        self.p_atm = None   # baseline atmospheric pressure (bar[a]) measured at no-flow
         
     def connect(self):
-        """Establish connection to the flow controller"""
+        """Establish connection to the flow controller using the Propar protocol
+        
+        Returns:
+            bool: True if connection successful, False otherwise
+        """
         if self.simulation_mode:
-            # Simulate connection for development/testing
             self.connected = True
             print(f"Simulated connection to {self.port}")
             return True
-        else:
-            # Use real Modbus connection
-            self.connected = self.modbus_controller.connect()
-            return self.connected
-    
+            
+        try:
+            # First, check if port exists and is available
+            import serial.tools.list_ports
+            available_ports = [p.device for p in serial.tools.list_ports.comports()]
+            if self.port not in available_ports:
+                logging.error(f"Port {self.port} not found. Available ports: {available_ports}")
+                return False
+
+            # Create a new Propar instrument instance
+            self.instrument = propar.instrument(self.port, baudrate=self.baudrate)
+            
+            try:
+                # Just verify we can read the measure value (parameter 8)
+                measure = self.instrument.readParameter(8)
+                logging.info(f"Initial measure value: {measure}")
+                
+                self.connected = True
+                logging.info(f"Successfully connected to flow controller on {self.port}")
+                return True
+            except Exception as e:
+                logging.error(f"Could not verify device connection: {str(e)}")
+                return False
+            
+        except Exception as e:
+            logging.error(f"Connection error: {str(e)}")
+            self.connected = False
+            self.master = None
+            self.instrument = None
+            return False
+                
+        except Exception as e:
+            logging.error(f"Error connecting to device: {str(e)}")
+            self.connected = False
+            return False
+            
     def disconnect(self):
-        """Close connection"""
+        """Close the connection to the flow controller"""
         if self.simulation_mode:
             self.connected = False
-        else:
-            if self.modbus_controller is not None:
-                self.modbus_controller.disconnect()
+            return
+            
+        try:
+            if self.master:
+                self.master.close()
+            self.master = None
+            self.instrument = None
             self.connected = False
-    
+            logging.info("Successfully disconnected from flow controller")
+        except Exception as e:
+            logging.error(f"Error during disconnect: {str(e)}")
+            self.connected = False
+            
     def set_flow_rate(self, flow_rate):
-        """Set flow rate in ml/min"""
+        """Set flow rate in ml/min using Propar protocol
+        
+        Args:
+            flow_rate (float): The desired flow rate in ml/min
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
         if self.simulation_mode:
             print(f"Simulated: Setting flow rate to {flow_rate} ml/min")
             return True
-        else:
-            with self.command_lock:
-                time.sleep(0.1)  # Small delay between commands
-                return self.modbus_controller.set_flow_rate(flow_rate)
-    
-    def get_measurements(self):
-        """Get current measurements: flow, P1 (inlet), P2 (outlet), temperature"""
         
+        if not self.connected:
+            logging.error("Not connected to device")
+            return False
+            
+        max_retries = 3
+        retry_delay = 1.0  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                # Write setpoint (parameter 9)
+                # Convert flow_rate to 0-32000 range
+                setpoint = int((float(flow_rate) / 5000.0) * 32000)  # Assuming 5000 ml/min max
+                self.instrument.writeParameter(9, setpoint)
+                return True
+            except Exception as e:
+                logging.error(f"Set flow rate attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    try:
+                        # Try to reconnect
+                        self.disconnect()
+                        if self.connect():
+                            logging.info("Successfully reconnected")
+                            continue
+                    except Exception as reconnect_error:
+                        logging.error(f"Reconnection failed: {str(reconnect_error)}")
+        
+        return False
+    
+
+    def calibrate_atmospheric_pressure(self, samples=10, settle_s=2.0, outlet_node=3):
+        """
+        Measure atmospheric baseline from the OUTLET sensor at no-flow.
+        Stores the average as self.p_atm (bar[a]).
+        Returns True on success, False otherwise.
+        """
+        if self.simulation_mode:
+            # Simulate a plausible baseline
+            self.p_atm = 1.013
+            logging.info(f"[SIM] Calibrated p_atm = {self.p_atm:.4f} bar(a)")
+            return True
+
+        if not self.connected:
+            logging.error("Not connected to device")
+            return False
+
+        try:
+            # Small settle time at zero-flow before sampling
+            time.sleep(settle_s)
+
+            vals = []
+            for _ in range(samples):
+                try:
+                    raw = self.instrument.readParameter(8, outlet_node)  # Parameter 8 from outlet node
+                    if raw is not None:
+                        # Convert raw (0..32000) to pressure (0..17 bar)
+                        p = (float(raw) / 32000.0) * 17.0
+                        vals.append(p)
+                except Exception as e:
+                    logging.error(f"Atmosphere sample read failed: {e}")
+                time.sleep(0.2)
+
+            if len(vals) >= max(2, samples // 2):
+                self.p_atm = float(np.mean(vals))
+                logging.info(f"Calibrated p_atm = {self.p_atm:.4f} bar(a) from {len(vals)} samples")
+                return True
+            else:
+                logging.error("Not enough samples to calibrate p_atm")
+                return False
+
+        except Exception as e:
+            logging.error(f"Calibration error: {e}")
+            return False
+
+        
+    def get_measurements(self):
+        """Get current measurements using Propar protocol
+        
+        Returns:
+            dict: Dictionary containing flow_rate, inlet_pressure, outlet_pressure,
+                  temperature, pressure_drop, and timestamp. None if error occurs.
+        """
         if self.simulation_mode:
             # Simulate realistic values for development
             flow = np.random.normal(1000, 50)  # ml/min
             p1 = np.random.normal(2.5, 0.1)    # bar(a) - inlet pressure
-            p2 = 1.013  # bar(a) - atmospheric outlet
+            p2 = np.random.normal(1.5, 0.1)    # bar(a) - outlet pressure
             temp = np.random.normal(23, 1)     # °C
             
             return {
@@ -92,24 +229,125 @@ class BronkhorstController:
                 'inlet_pressure': max(0, p1),
                 'outlet_pressure': p2,
                 'temperature': temp,
-                'pressure_drop': max(0, p1 - p2),
+                'pressure_drop': max(0, p2 - 1.013),  # Difference from atmospheric
                 'timestamp': time.time()
             }
-        else:
-            # Use real Modbus measurements with locking
-            with self.command_lock:
-                time.sleep(0.1)  # Small delay between commands
-                return self.modbus_controller.get_all_measurements()
-    
-    def get_latest_data(self):
-        """Get the latest cached data (thread-safe)"""
-        with self.data_lock:
-            return self.latest_data
-    
-    def update_latest_data(self, data):
-        """Update the latest cached data (thread-safe)"""
-        with self.data_lock:
-            self.latest_data = data
+            
+        if not self.connected:
+            logging.error("Not connected to device")
+            return None
+            
+        max_retries = 3
+        retry_delay = 1.0  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                # Read flow measurement (parameter 8 = measure)
+                measured = self.instrument.readParameter(8)
+                logging.info(f"Raw flow reading (parameter 8): {measured}")
+                
+                if measured is not None:
+                    # ProPar protocol: 32000 = 100%, max is 41943 (131.07%)
+                    # Convert to percentage first
+                    percentage = (float(measured) / 32000.0) * 100.0
+                    # Then convert percentage to flow rate (0-5000 ml/min range)
+                    flow_rate = (percentage / 100.0) * 5000
+                    logging.info(f"Raw value {measured} = {percentage:.1f}% = {flow_rate:.1f} ml/min")
+                else:
+                    flow_rate = 0
+                    logging.warning("Could not read flow measurement")
+                    
+                # Read pressure values using node-specific parameters
+                # Node 1 = Flow controller
+                # Node 2 = Pressure sensor 1 (inlet)
+                # Node 3 = Pressure sensor 2 (outlet)
+                # Parameter 8 = Measured value
+                
+                # Read inlet pressure (Node 2, Parameter 8)
+                try:
+                    inlet_p = self.instrument.readParameter(8, 2)  # Parameter 8 from node 2
+                    logging.info(f"Raw inlet pressure reading from node 2: {inlet_p}")
+                    
+                    if inlet_p is not None:
+                        # ProPar protocol: 32000 = 100%, max range is 0-17 bar
+                        # Convert raw value directly to pressure
+                        inlet_pressure = (float(inlet_p) / 32000.0) * 17.0
+                        logging.info(f"Raw value {inlet_p} = {inlet_pressure:.3f} bar")
+                    else:
+                        inlet_pressure = 0
+                        logging.warning("Could not read inlet pressure")
+                except Exception as e:
+                    logging.error(f"Error reading inlet pressure: {str(e)}")
+                    inlet_pressure = 0
+                
+                # Read outlet pressure (Node 3, Parameter 8)
+                try:
+                    outlet_p = self.instrument.readParameter(8, 3)  # Parameter 8 from node 3
+                    logging.info(f"Raw outlet pressure reading from node 3: {outlet_p}")
+                    
+                    if outlet_p is not None:
+                        # ProPar protocol: 32000 = 100%, max range is 0-17 bar
+                        # Convert raw value directly to pressure
+                        outlet_pressure = (float(outlet_p) / 32000.0) * 17.0
+                        logging.info(f"Raw value {outlet_p} = {outlet_pressure:.3f} bar")
+                    else:
+                        outlet_pressure = 1.013  # Default to atmospheric
+                        logging.warning("Could not read outlet pressure, using atmospheric pressure")
+                except Exception as e:
+                    logging.error(f"Error reading outlet pressure: {str(e)}")
+                    outlet_pressure = 1.013  # Default to atmospheric
+
+                measurements = {
+                    'flow': flow_rate,
+                    'inlet': inlet_pressure,
+                    'outlet': outlet_pressure,
+                }
+                
+                # Read temperature
+                temp = self.instrument.readParameter(142)
+                logging.info(f"Raw temperature reading: {temp}")
+                if temp is not None:
+                    temperature = float(temp) / 32000.0 * 100  # Convert to °C
+                    measurements['temp'] = temperature
+                    logging.info(f"Converted temperature: {temperature:.1f} °C")
+                else:
+                    measurements['temp'] = 20  # Default temperature
+                    logging.warning("Could not read temperature")
+                
+                # Use atmospheric pressure if no outlet pressure reading
+                if 'outlet' not in measurements:
+                    measurements['outlet'] = 1.013  # bar(a)
+                    logging.warning("No outlet pressure reading found, using atmospheric pressure")
+                    
+                # Create return dictionary with all measurements
+                inlet_p = float(measurements.get('inlet', 0))
+                outlet_p = float(measurements.get('outlet', 1.013))
+                baseline_atm = self.p_atm if self.p_atm is not None else 1.013
+
+                return {
+                    'flow_rate': float(measurements.get('flow', 0)),
+                    'inlet_pressure': inlet_p,
+                    'outlet_pressure': outlet_p,
+                    'temperature': float(measurements.get('temp', 20)),
+                    'pressure_drop': max(0, (outlet_p - baseline_atm)),  # outlet relative to calibrated atmosphere
+                    'p_atm': baseline_atm,
+                    'timestamp': time.time()
+                }
+                
+            except Exception as e:
+                logging.error(f"Get measurements attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    try:
+                        # Try to reconnect
+                        self.disconnect()
+                        if self.connect():
+                            logging.info("Successfully reconnected")
+                            continue
+                    except Exception as reconnect_error:
+                        logging.error(f"Reconnection failed: {str(reconnect_error)}")
+        
+        return None
 
 class PressureDropTester:
     """Main application class"""
@@ -124,11 +362,18 @@ class PressureDropTester:
         self.reference_data = []
         self.test_running = False
         self.test_thread = None
+        self.latest_data = None
+        self.reading_thread = None
+        self.reading_active = False
+        self.update_scheduled = False
+
         
-        # Background reading thread
+        ###--------------------------------------------------------------------------------------###
+        # Background reading thread           THESE ARE NOT IN NEW CODE, commented out for now
         self.reading_thread = None
         self.reading_active = False
         self.update_scheduled = False  # Prevent multiple update_readings schedules
+        ###--------------------------------------------------------------------------------------###
         
         # Controller
         self.controller = BronkhorstController()
@@ -158,7 +403,7 @@ class PressureDropTester:
         conn_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
         
         ttk.Label(conn_frame, text="Port:").grid(row=0, column=0, padx=(0, 5))
-        self.port_var = tk.StringVar(value="COM1")
+        self.port_var = tk.StringVar(value="COM3")
         ttk.Combobox(conn_frame, textvariable=self.port_var, 
                     values=["COM1", "COM2", "COM3", "COM4", "COM5"]).grid(row=0, column=1, padx=(0, 10))
         
@@ -227,6 +472,8 @@ class PressureDropTester:
         ttk.Button(data_frame, text="Save Data", command=self.save_data).grid(row=0, column=0, padx=(0, 5))
         ttk.Button(data_frame, text="Load Reference", command=self.load_reference).grid(row=0, column=1, padx=(0, 5))
         ttk.Button(data_frame, text="Clear Plot", command=self.clear_plot).grid(row=0, column=2)
+        ttk.Button(data_frame, text="Calibrate Atmosphere", command=self._calibrate_atmosphere).grid(row=6, column=0, columnspan=3, pady=(10,0))
+
         
         # Current readings frame
         readings_frame = ttk.LabelFrame(main_frame, text="Current Readings", padding="5")
@@ -261,59 +508,52 @@ class PressureDropTester:
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         
         # Start reading updates
-        self.update_scheduled = True
+        ###--------------------------------------------------------------------------------------###
+        self.update_scheduled = True   #not in other code 
+        ###--------------------------------------------------------------------------------------###
         self.update_readings()
     
+    ###------------------------------------------------------------------------------------------------------###
     def start_background_reading(self):
-        """Start background thread for reading measurements"""
-        if self.reading_thread is None or not self.reading_thread.is_alive():
-            self.reading_active = True
-            self.reading_thread = threading.Thread(target=self._background_reading_loop, daemon=True)
-            self.reading_thread.start()
-    
+        if self.reading_active:
+            return
+        self.reading_active = True
+        self.update_scheduled = True
+        self.reading_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self.reading_thread.start()
+        # Kick off the first UI update tick
+        self.root.after(0, self.update_readings)
+
     def stop_background_reading(self):
-        """Stop background reading thread"""
         self.reading_active = False
-        if self.reading_thread:
-            self.reading_thread.join(timeout=2.0)
-    
-    def _background_reading_loop(self):
-        """Background loop to continuously read measurements"""
+        self.update_scheduled = False
+        if self.reading_thread and self.reading_thread.is_alive():
+            self.reading_thread.join(timeout=1)
+        self.reading_thread = None
+
+    def _reader_loop(self):
         while self.reading_active and self.controller.connected:
             try:
-                data = self.controller.get_measurements()
+                data = self.controller.get_measurements()   # <-- uses your existing method
                 if data:
-                    self.controller.update_latest_data(data)
+                    self.latest_data = data                 # <-- stash latest
             except Exception as e:
-                print(f"Error reading measurements: {e}")
-            time.sleep(2.0)  # Increased delay - read every 2 seconds to avoid overwhelming device
-        
+                logging.error(f"Reader error: {e}")
+            time.sleep(0.5)  # small polling delay
+
+    ###------------------------------------------------------------------------------------------------------###
     def toggle_simulation(self):
-        """Toggle between simulation and real hardware mode"""
+        """Toggle between simulation and real hardware mode (single-file Propar controller)"""
         new_mode = self.sim_mode_var.get()
-        
-        # If switching to hardware mode, try to import modbus controller
-        if not new_mode and self.controller.modbus_controller is None:
-            try:
-                from modbus_controller import BronkhorstModbusController
-                self.controller.modbus_controller = BronkhorstModbusController(
-                    self.controller.port, 
-                    self.controller.address, 
-                    self.controller.baudrate
-                )
-            except ImportError:
-                messagebox.showerror("Error", "Modbus controller not available. Staying in simulation mode.")
-                self.sim_mode_var.set(True)
-                return
-        
         self.controller.simulation_mode = new_mode
-        
+
+        # If already connected, restart connection (and background reading) to apply mode
         if self.controller.connected:
-            # Reconnect with new mode
             self.stop_background_reading()
             self.controller.disconnect()
             self.status_label.config(text="Disconnected", foreground="red")
             self.connect_btn.config(text="Connect")
+
     
     def toggle_connection(self):
         """Connect or disconnect from controller"""
@@ -345,25 +585,23 @@ class PressureDropTester:
     def update_readings(self):
         """Update current readings display"""
         if not self.update_scheduled:
-            return  # Don't continue if we've been cancelled
-            
-        if self.controller.connected:
-            data = self.controller.get_latest_data()
-            if data:
-                try:
-                    self.flow_label.config(text=f"Flow: {data['flow_rate']:.1f} ml/min")
-                    self.p1_label.config(text=f"Inlet P: {data['inlet_pressure']:.3f} bar")
-                    self.p2_label.config(text=f"Outlet P: {data['outlet_pressure']:.3f} bar")
-                    self.dp_label.config(text=f"ΔP: {data['pressure_drop']*1000:.1f} mbar")
-                    self.temp_label.config(text=f"Temp: {data['temperature']:.1f} °C")
-                except tk.TclError:
-                    # Widget was destroyed, stop updates
-                    self.update_scheduled = False
-                    return
-        
-        # Schedule next update
+            return
+
+        if self.controller.connected and self.latest_data:
+            data = self.latest_data
+            try:
+                self.flow_label.config(text=f"Flow: {data['flow_rate']:.1f} ml/min")
+                self.p1_label.config(text=f"Inlet P: {data['inlet_pressure']:.3f} bar")
+                self.p2_label.config(text=f"Outlet P: {data['outlet_pressure']:.3f} bar")
+                self.dp_label.config(text=f"ΔP: {data['pressure_drop']*1000:.1f} mbar")
+                self.temp_label.config(text=f"Temp: {data['temperature']:.1f} °C")
+            except tk.TclError:
+                self.update_scheduled = False
+                return
+
         if self.update_scheduled:
             self.root.after(1000, self.update_readings)
+
     
     def set_manual_flow(self):
         """Set manual flow rate"""
@@ -438,6 +676,25 @@ class PressureDropTester:
         
         self.test_thread = threading.Thread(target=run_reference, daemon=True)
         self.test_thread.start()
+
+    def _calibrate_atmosphere(self):
+        if not self.controller.connected:
+            messagebox.showerror("Error", "Controller not connected")
+            return
+
+        # Ensure flow is zero
+        try:
+            self.controller.set_flow_rate(0)
+            time.sleep(2.0)  # allow settle
+        except Exception as e:
+            logging.error(f"Error setting flow to 0: {e}")
+            return
+
+        if self.controller.calibrate_atmospheric_pressure(samples=10, settle_s=2.0):
+            messagebox.showinfo("Calibration", f"Atmospheric pressure calibrated: {self.controller.p_atm:.3f} bar(a)")
+        else:
+            messagebox.showerror("Calibration", "Failed to calibrate atmospheric pressure")
+
     
     def start_test(self):
         """Start automated pressure drop test"""
